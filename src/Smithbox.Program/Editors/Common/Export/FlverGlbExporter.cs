@@ -391,6 +391,8 @@ public static class FlverGlbExporter
         var textureIndexByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var textureVirtualPathByKey = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var derivedNormalBySourceKey = new Dictionary<string, DerivedNormalInfo>(StringComparer.OrdinalIgnoreCase);
+        var derivedBaseColorAlphaByPair = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var alphaAnalysisByTextureKey = new Dictionary<string, AlphaAnalysis>(StringComparer.OrdinalIgnoreCase);
 
         for (int i = 0; i < flver.Materials.Count; i++)
         {
@@ -402,6 +404,7 @@ public static class FlverGlbExporter
             string baseColorKey = null;
             string normalKey = null;
             string mrKey = null;
+            string opacityKey = null;
 
             foreach (var tex in mat.Textures)
             {
@@ -436,6 +439,10 @@ public static class FlverGlbExporter
                 {
                     mrKey = resolvedKey;
                 }
+                else if (opacityKey == null && IsOpacityParam(paramName))
+                {
+                    opacityKey = resolvedKey;
+                }
             }
 
             if (baseColorKey == null && mat.Textures.Count > 0)
@@ -464,7 +471,7 @@ public static class FlverGlbExporter
             }
 
             if (!string.IsNullOrWhiteSpace(normalKey) &&
-                textures.TryGetValue(normalKey, out var sourceNormalTex))
+                TryEnsureTextureData(normalKey, textures, textureVirtualPathByKey, project, out var sourceNormalTex))
             {
                 if (!derivedNormalBySourceKey.TryGetValue(normalKey, out var derivedInfo))
                 {
@@ -483,10 +490,41 @@ public static class FlverGlbExporter
                 }
             }
 
+            if (!string.IsNullOrWhiteSpace(opacityKey))
+            {
+                baseColorKey = EnsureBaseColorWithOpacity(
+                    baseColorKey,
+                    opacityKey,
+                    textures,
+                    textureVirtualPathByKey,
+                    project,
+                    derivedBaseColorAlphaByPair,
+                    warnings);
+            }
+
             var matDef = new Dictionary<string, object>
             {
                 ["name"] = materialName
             };
+
+            var alphaMode = DetermineAlphaMode(
+                mat,
+                lookup,
+                baseColorKey,
+                opacityKey,
+                textures,
+                textureVirtualPathByKey,
+                project,
+                alphaAnalysisByTextureKey,
+                out var alphaCutoff);
+            if (alphaMode != "OPAQUE")
+            {
+                matDef["alphaMode"] = alphaMode;
+                if (alphaMode == "MASK")
+                {
+                    matDef["alphaCutoff"] = alphaCutoff;
+                }
+            }
 
             var pbr = new Dictionary<string, object>
             {
@@ -731,19 +769,9 @@ public static class FlverGlbExporter
             return existingTextureIndex;
         }
 
-        if (!textures.TryGetValue(key, out var texture))
+        if (!TryEnsureTextureData(key, textures, textureVirtualPathByKey, project, out var texture))
         {
-            if (textureVirtualPathByKey.TryGetValue(key, out var textureVirtualPath) &&
-                TryReadTextureDds(project, textureVirtualPath, key, out var ddsBytes) &&
-                TryConvertDdsToPng(ddsBytes, out var pngBytes))
-            {
-                texture = new TextureData(key, pngBytes);
-                textures[key] = texture;
-            }
-            else
-            {
-                return null;
-            }
+            return null;
         }
 
         var hash = Convert.ToHexString(SHA256.HashData(texture.PngBytes));
@@ -785,6 +813,36 @@ public static class FlverGlbExporter
         textureIndexByHash[hash] = textureIndex;
         textureIndexByKey[key] = textureIndex;
         return textureIndex;
+    }
+
+    private static bool TryEnsureTextureData(
+        string key,
+        Dictionary<string, TextureData> textures,
+        Dictionary<string, string> textureVirtualPathByKey,
+        ProjectEntry project,
+        out TextureData texture)
+    {
+        texture = null;
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return false;
+        }
+
+        if (textures.TryGetValue(key, out texture))
+        {
+            return true;
+        }
+
+        if (textureVirtualPathByKey.TryGetValue(key, out var textureVirtualPath) &&
+            TryReadTextureDds(project, textureVirtualPath, key, out var ddsBytes) &&
+            TryConvertDdsToPng(ddsBytes, out var pngBytes))
+        {
+            texture = new TextureData(key, pngBytes);
+            textures[key] = texture;
+            return true;
+        }
+
+        return false;
     }
 
     private static int AddFloatAccessor(
@@ -1069,17 +1127,13 @@ public static class FlverGlbExporter
     {
         normalPng = null;
         roughnessPng = null;
-        hasPackedRoughness = false;
+        hasPackedRoughness = true;
 
         try
         {
             using var source = Image.Load<Rgba32>(sourcePng);
             using var normalImage = new Image<Rgba32>(source.Width, source.Height);
             using var roughnessImage = new Image<Rgba32>(source.Width, source.Height);
-
-            double diffSum = 0;
-            long sampleCount = 0;
-            var stride = Math.Max(1, Math.Min(source.Width, source.Height) / 128);
 
             for (int y = 0; y < source.Height; y++)
             {
@@ -1101,19 +1155,8 @@ public static class FlverGlbExporter
                     // glTF roughness is stored in G channel; source uses inverse roughness.
                     var roughness = (byte)(255 - src.B);
                     roughnessImage[x, y] = new Rgba32(0, roughness, 0, 255);
-
-                    if (x % stride == 0 && y % stride == 0)
-                    {
-                        var srcB = src.B / 255f;
-                        var expectedB = outB / 255f;
-                        diffSum += Math.Abs(srcB - expectedB);
-                        sampleCount++;
-                    }
                 }
             }
-
-            var avgDiff = sampleCount > 0 ? diffSum / sampleCount : 0.0;
-            hasPackedRoughness = avgDiff > 0.08;
 
             using (var ms = new MemoryStream())
             {
@@ -1121,12 +1164,9 @@ public static class FlverGlbExporter
                 normalPng = ms.ToArray();
             }
 
-            if (hasPackedRoughness)
-            {
-                using var ms = new MemoryStream();
-                roughnessImage.SaveAsPng(ms);
-                roughnessPng = ms.ToArray();
-            }
+            using var roughnessStream = new MemoryStream();
+            roughnessImage.SaveAsPng(roughnessStream);
+            roughnessPng = roughnessStream.ToArray();
 
             return true;
         }
@@ -1142,6 +1182,453 @@ public static class FlverGlbExporter
         return (byte)MathF.Round(clamped * 255f);
     }
 
+    private static string EnsureBaseColorWithOpacity(
+        string baseColorKey,
+        string opacityKey,
+        Dictionary<string, TextureData> textures,
+        Dictionary<string, string> textureVirtualPathByKey,
+        ProjectEntry project,
+        Dictionary<string, string> derivedBaseColorAlphaByPair,
+        List<string> warnings)
+    {
+        if (string.IsNullOrWhiteSpace(opacityKey))
+        {
+            return baseColorKey;
+        }
+
+        if (string.IsNullOrWhiteSpace(baseColorKey))
+        {
+            return opacityKey;
+        }
+
+        if (baseColorKey.Equals(opacityKey, StringComparison.OrdinalIgnoreCase))
+        {
+            return baseColorKey;
+        }
+
+        var pairKey = $"{baseColorKey}|{opacityKey}";
+        if (derivedBaseColorAlphaByPair.TryGetValue(pairKey, out var existingCompositeKey))
+        {
+            return existingCompositeKey;
+        }
+
+        if (!TryEnsureTextureData(baseColorKey, textures, textureVirtualPathByKey, project, out var baseColorTexture) ||
+            !TryEnsureTextureData(opacityKey, textures, textureVirtualPathByKey, project, out var opacityTexture))
+        {
+            return baseColorKey;
+        }
+
+        if (!TryMergeBaseColorAndOpacity(baseColorTexture.PngBytes, opacityTexture.PngBytes, out var mergedPngBytes))
+        {
+            warnings.Add($"Failed to merge opacity map into base color: {baseColorKey} + {opacityKey}");
+            return baseColorKey;
+        }
+
+        var compositeKey = $"{baseColorKey}__glb_alpha_{opacityKey}";
+        textures[compositeKey] = new TextureData(compositeKey, mergedPngBytes);
+        derivedBaseColorAlphaByPair[pairKey] = compositeKey;
+        return compositeKey;
+    }
+
+    private static bool TryMergeBaseColorAndOpacity(byte[] baseColorPng, byte[] opacityPng, out byte[] mergedPngBytes)
+    {
+        mergedPngBytes = null;
+
+        try
+        {
+            using var baseColorImage = Image.Load<Rgba32>(baseColorPng);
+            using var opacityImage = Image.Load<Rgba32>(opacityPng);
+            if (baseColorImage.Width != opacityImage.Width || baseColorImage.Height != opacityImage.Height)
+            {
+                return false;
+            }
+
+            var useOpacityAlpha = HasAnyNonOpaqueAlpha(opacityImage);
+            using var merged = new Image<Rgba32>(baseColorImage.Width, baseColorImage.Height);
+            for (int y = 0; y < baseColorImage.Height; y++)
+            {
+                for (int x = 0; x < baseColorImage.Width; x++)
+                {
+                    var basePixel = baseColorImage[x, y];
+                    var opacityPixel = opacityImage[x, y];
+                    var alpha = useOpacityAlpha ? opacityPixel.A : opacityPixel.R;
+                    merged[x, y] = new Rgba32(basePixel.R, basePixel.G, basePixel.B, alpha);
+                }
+            }
+
+            using var ms = new MemoryStream();
+            merged.SaveAsPng(ms);
+            mergedPngBytes = ms.ToArray();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string DetermineAlphaMode(
+        FLVER2.Material material,
+        MaterialLookup lookup,
+        string baseColorKey,
+        string opacityKey,
+        Dictionary<string, TextureData> textures,
+        Dictionary<string, string> textureVirtualPathByKey,
+        ProjectEntry project,
+        Dictionary<string, AlphaAnalysis> alphaAnalysisByTextureKey,
+        out float alphaCutoff)
+    {
+        alphaCutoff = 0.5f;
+
+        if (TryGetBlendMode(lookup, out var blendMode))
+        {
+            if (blendMode == (int)MTD.BlendMode.TexEdge || blendMode == (int)MTD.BlendMode.LSTexEdge)
+            {
+                return "MASK";
+            }
+
+            if (blendMode != (int)MTD.BlendMode.Normal && blendMode != (int)MTD.BlendMode.LSNormal)
+            {
+                return "BLEND";
+            }
+        }
+
+        if (TryGetAlphaTestSettings(lookup, out var hasAlphaTest, out var cutoffFromParams) && hasAlphaTest)
+        {
+            alphaCutoff = cutoffFromParams;
+            return "MASK";
+        }
+
+        if (!string.IsNullOrWhiteSpace(opacityKey))
+        {
+            if (IsMaskMaterialHint(material, lookup))
+            {
+                return "MASK";
+            }
+
+            return "BLEND";
+        }
+
+        if (!string.IsNullOrWhiteSpace(baseColorKey) &&
+            TryGetAlphaAnalysis(baseColorKey, textures, textureVirtualPathByKey, project, alphaAnalysisByTextureKey, out var alphaAnalysis) &&
+            alphaAnalysis.HasTransparency)
+        {
+            return alphaAnalysis.IsBinaryAlpha ? "MASK" : "BLEND";
+        }
+
+        return "OPAQUE";
+    }
+
+    private static bool TryGetBlendMode(MaterialLookup lookup, out int blendMode)
+    {
+        blendMode = 0;
+
+        foreach (var param in EnumerateMaterialParams(lookup))
+        {
+            var paramName = param.Key.ToLowerInvariant();
+            if (!paramName.Contains("blendmode"))
+            {
+                continue;
+            }
+
+            if (TryGetScalarInt(param.Value, out blendMode))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetAlphaTestSettings(MaterialLookup lookup, out bool hasAlphaTest, out float alphaCutoff)
+    {
+        hasAlphaTest = false;
+        alphaCutoff = 0.5f;
+
+        foreach (var param in EnumerateMaterialParams(lookup))
+        {
+            var paramName = param.Key.ToLowerInvariant();
+            var isAlphaTestFlag = paramName.Contains("alphatest") || paramName.Contains("alphaclip");
+            var isAlphaCutoff = (paramName.Contains("alpha") || paramName.Contains("clip")) &&
+                                (paramName.Contains("cutoff") || paramName.Contains("threshold"));
+
+            if (isAlphaTestFlag && TryGetScalarBool(param.Value, out var enabled) && enabled)
+            {
+                hasAlphaTest = true;
+            }
+
+            if (isAlphaCutoff && TryGetScalarFloat(param.Value, out var cutoff))
+            {
+                hasAlphaTest = true;
+                alphaCutoff = NormalizeAlphaCutoff(cutoff);
+            }
+        }
+
+        return hasAlphaTest;
+    }
+
+    private static bool IsMaskMaterialHint(FLVER2.Material material, MaterialLookup lookup)
+    {
+        var text = string.Join(" ",
+            material?.Name ?? string.Empty,
+            material?.MTD ?? string.Empty,
+            lookup?.MATBIN?.ShaderPath ?? string.Empty,
+            lookup?.MATBIN?.SourcePath ?? string.Empty).ToLowerInvariant();
+
+        return text.Contains("alphatest") ||
+               text.Contains("cutout") ||
+               text.Contains("clip") ||
+               text.Contains("texedge");
+    }
+
+    private static bool TryGetAlphaAnalysis(
+        string textureKey,
+        Dictionary<string, TextureData> textures,
+        Dictionary<string, string> textureVirtualPathByKey,
+        ProjectEntry project,
+        Dictionary<string, AlphaAnalysis> alphaAnalysisByTextureKey,
+        out AlphaAnalysis analysis)
+    {
+        if (alphaAnalysisByTextureKey.TryGetValue(textureKey, out analysis))
+        {
+            return true;
+        }
+
+        analysis = default;
+        if (!TryEnsureTextureData(textureKey, textures, textureVirtualPathByKey, project, out var texture))
+        {
+            return false;
+        }
+
+        if (!TryAnalyzeAlpha(texture.PngBytes, out analysis))
+        {
+            return false;
+        }
+
+        alphaAnalysisByTextureKey[textureKey] = analysis;
+        return true;
+    }
+
+    private static bool TryAnalyzeAlpha(byte[] pngBytes, out AlphaAnalysis analysis)
+    {
+        analysis = default;
+
+        try
+        {
+            using var image = Image.Load<Rgba32>(pngBytes);
+            bool hasTransparency = false;
+            bool isBinaryAlpha = true;
+
+            for (int y = 0; y < image.Height; y++)
+            {
+                for (int x = 0; x < image.Width; x++)
+                {
+                    var alpha = image[x, y].A;
+                    if (alpha < 255)
+                    {
+                        hasTransparency = true;
+                    }
+
+                    if (alpha != 0 && alpha != 255)
+                    {
+                        isBinaryAlpha = false;
+                    }
+
+                    if (hasTransparency && !isBinaryAlpha)
+                    {
+                        break;
+                    }
+                }
+
+                if (hasTransparency && !isBinaryAlpha)
+                {
+                    break;
+                }
+            }
+
+            analysis = new AlphaAnalysis(hasTransparency, hasTransparency && isBinaryAlpha);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool HasAnyNonOpaqueAlpha(Image<Rgba32> image)
+    {
+        for (int y = 0; y < image.Height; y++)
+        {
+            for (int x = 0; x < image.Width; x++)
+            {
+                if (image[x, y].A < 255)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static float NormalizeAlphaCutoff(float value)
+    {
+        if (value > 1.0f && value <= 255.0f)
+        {
+            value /= 255.0f;
+        }
+
+        return Math.Clamp(value, 0.0f, 1.0f);
+    }
+
+    private static IEnumerable<KeyValuePair<string, object>> EnumerateMaterialParams(MaterialLookup lookup)
+    {
+        if (lookup?.MTD?.Params != null)
+        {
+            foreach (var param in lookup.MTD.Params)
+            {
+                if (param != null && !string.IsNullOrWhiteSpace(param.Name))
+                {
+                    yield return new KeyValuePair<string, object>(param.Name, param.Value);
+                }
+            }
+        }
+
+        if (lookup?.MATBIN?.Params != null)
+        {
+            foreach (var param in lookup.MATBIN.Params)
+            {
+                if (param != null && !string.IsNullOrWhiteSpace(param.Name))
+                {
+                    yield return new KeyValuePair<string, object>(param.Name, param.Value);
+                }
+            }
+        }
+    }
+
+    private static bool TryGetScalarInt(object value, out int result)
+    {
+        result = 0;
+        if (value == null)
+        {
+            return false;
+        }
+
+        switch (value)
+        {
+            case int i:
+                result = i;
+                return true;
+            case uint ui:
+                result = unchecked((int)ui);
+                return true;
+            case short s:
+                result = s;
+                return true;
+            case ushort us:
+                result = us;
+                return true;
+            case byte b:
+                result = b;
+                return true;
+            case sbyte sb:
+                result = sb;
+                return true;
+            case bool boolValue:
+                result = boolValue ? 1 : 0;
+                return true;
+            case long l:
+                result = (int)l;
+                return true;
+            case float f:
+                result = (int)f;
+                return true;
+            case double d:
+                result = (int)d;
+                return true;
+            case int[] intArray when intArray.Length > 0:
+                result = intArray[0];
+                return true;
+            case float[] floatArray when floatArray.Length > 0:
+                result = (int)floatArray[0];
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool TryGetScalarFloat(object value, out float result)
+    {
+        result = 0.0f;
+        if (value == null)
+        {
+            return false;
+        }
+
+        switch (value)
+        {
+            case float f:
+                result = f;
+                return true;
+            case double d:
+                result = (float)d;
+                return true;
+            case int i:
+                result = i;
+                return true;
+            case uint ui:
+                result = ui;
+                return true;
+            case short s:
+                result = s;
+                return true;
+            case ushort us:
+                result = us;
+                return true;
+            case byte b:
+                result = b;
+                return true;
+            case sbyte sb:
+                result = sb;
+                return true;
+            case bool boolValue:
+                result = boolValue ? 1.0f : 0.0f;
+                return true;
+            case int[] intArray when intArray.Length > 0:
+                result = intArray[0];
+                return true;
+            case float[] floatArray when floatArray.Length > 0:
+                result = floatArray[0];
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool TryGetScalarBool(object value, out bool result)
+    {
+        result = false;
+        if (value == null)
+        {
+            return false;
+        }
+
+        switch (value)
+        {
+            case bool b:
+                result = b;
+                return true;
+            default:
+                if (TryGetScalarFloat(value, out var floatValue))
+                {
+                    result = floatValue > 0.0f;
+                    return true;
+                }
+
+                return false;
+        }
+    }
+
     private static bool IsBaseColorParam(string paramName)
     {
         return paramName.Contains("g_diffuse") || paramName.Contains("albedo") || paramName.Contains("basecolor");
@@ -1155,6 +1642,14 @@ public static class FlverGlbExporter
     private static bool IsMetallicRoughnessParam(string paramName)
     {
         return paramName.Contains("metallicroughness") || paramName.Contains("roughness") || paramName.Contains("metallic");
+    }
+
+    private static bool IsOpacityParam(string paramName)
+    {
+        return paramName.Contains("opacity") ||
+               paramName.Contains("alpha") ||
+               paramName.Contains("transparency") ||
+               paramName.Contains("dissolve");
     }
 
     private static string NormalizeTextureKey(string input)
@@ -1203,6 +1698,18 @@ public static class FlverGlbExporter
         {
             MTD = mtd;
             MATBIN = matbin;
+        }
+    }
+
+    private readonly struct AlphaAnalysis
+    {
+        public bool HasTransparency { get; }
+        public bool IsBinaryAlpha { get; }
+
+        public AlphaAnalysis(bool hasTransparency, bool isBinaryAlpha)
+        {
+            HasTransparency = hasTransparency;
+            IsBinaryAlpha = isBinaryAlpha;
         }
     }
 
