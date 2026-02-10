@@ -2,6 +2,7 @@
 using Hexa.NET.ImGui;
 using SoulsFormats;
 using StudioCore.Application;
+using StudioCore.Editors.Common;
 using StudioCore.Renderer;
 using StudioCore.Utilities;
 using System;
@@ -130,6 +131,12 @@ public class ModelInsightView
                 ExtractMaterial(Project, entry, outputDirectory);
             }
             UIHelper.Tooltip("Extract the MTD or MATBIN that the textures are linked to for this current selection.");
+
+            if (ImGui.Button("Export GLB", DPI.WholeWidthButton(windowWidth, 24)))
+            {
+                ExportGLB(Project, entry, outputDirectory);
+            }
+            UIHelper.Tooltip("Export a GLB with embedded PNG textures and mapped materials for direct use in Blender.");
 
             UIHelper.SimpleHeader("flverHeader", "FLVER", "", UI.Current.ImGui_AliasName_Text);
 
@@ -470,6 +477,44 @@ public class ModelInsightView
         else
         {
             Smithbox.Log(this, "Could not complete texture extraction.");
+        }
+    }
+
+    public void ExportGLB(ProjectEntry project, FlverInsightEntry entry, string outputDirectory)
+    {
+        var textureEntries = entry.Entries
+            .Select(e => new FlverGlbTextureEntry(e.Name, e.VirtualPath, e.MaterialString, e.MTD, e.MATBIN))
+            .ToList();
+
+        var options = new FlverGlbExportOptions
+        {
+            IncludeFolder = CFG.Current.MapEditor_ModelDataExtraction_IncludeFolder,
+            EmbedPngTextures = true,
+            ExportSkeleton = false,
+            FaceSetMode = FlverGlbFaceSetMode.FirstOnly
+        };
+
+        var result = FlverGlbExporter.Export(
+            project,
+            entry.VirtualPath,
+            entry.FLVER2,
+            textureEntries,
+            outputDirectory,
+            entry.Name,
+            options);
+
+        foreach (var warning in result.Warnings)
+        {
+            Smithbox.Log(this, $"[GLB Export] {warning}");
+        }
+
+        if (result.Success)
+        {
+            Smithbox.Log(this, $"GLB export complete: {result.OutputPath}");
+        }
+        else
+        {
+            Smithbox.Log(this, $"Could not complete GLB export: {result.Error}");
         }
     }
 }

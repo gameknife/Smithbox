@@ -37,6 +37,10 @@
     <PlatformTargets>arm64;x64</PlatformTargets>
   </PropertyGroup>
 
+  <PropertyGroup Condition=" '$(Configuration)' == 'Release-win' ">
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
   <ItemGroup>
     <Compile Remove="Editors\File Browser\Data\Enums\**" />
     <Compile Remove="Editors\File Browser\Data\Models\**" />
