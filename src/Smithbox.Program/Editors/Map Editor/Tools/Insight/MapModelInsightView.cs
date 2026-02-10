@@ -58,6 +58,9 @@ public class MapModelInsightView
             var flverEntry = View.ModelInsightTool.SelectedDataEntry.Models.FirstOrDefault(
             e => e.Name == modelName);
 
+            if (flverEntry == null)
+                return;
+
             if (flverEntry != null && flverEntry != View.ModelInsightTool.SelectedFlverEntry)
             {
                 View.ModelInsightTool.SelectedFlverEntry = flverEntry;

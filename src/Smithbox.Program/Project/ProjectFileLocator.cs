@@ -423,6 +423,8 @@ public class ProjectFileLocator : IDisposable
                 .ToList();
         }
 
+        return;
+        
         // Collisions
         if (Project.Descriptor.ProjectType is ProjectType.DS2S or ProjectType.DS2)
         {
@@ -436,7 +438,7 @@ public class ProjectFileLocator : IDisposable
         {
             var mapid = map.Filename;
             var entries = new List<FileDictionaryEntry>();
-
+        
             if (Project.Descriptor.ProjectType is ProjectType.DS1 or ProjectType.DES)
             {
                 entries = Project.Locator.FileDictionary.Entries
@@ -466,7 +468,7 @@ public class ProjectFileLocator : IDisposable
                     .Where(e => !e.Archive.Contains("sd"))
                     .ToList();
             }
-
+        
             foreach (var entry in entries)
             {
                 CollisionFiles.Entries.Add(entry);
